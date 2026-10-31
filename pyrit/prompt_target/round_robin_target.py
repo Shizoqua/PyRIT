@@ -9,6 +9,7 @@ from pyrit.models import (
     TARGET_EVAL_PARAM_FALLBACKS,
     TARGET_EVAL_PARAMS,
     ComponentIdentifier,
+    Identifiable,
     Message,
 )
 from pyrit.prompt_target.common.prompt_target import PromptTarget
@@ -233,13 +234,15 @@ def _validate_configuration_consistency(targets: list[PromptTarget]) -> None:
     target has the same configuration.
 
     Uses ``as_identifier_params()`` for comparison: two configurations that
-    behave identically produce equal dicts.
+    behave identically produce equal dicts. Normalizers that are not shared
+    instances must also have equal settings.
 
     Args:
         targets: The inner targets to validate.
 
     Raises:
-        ValueError: If any inner target has a different configuration.
+        ValueError: If any inner target has a different configuration, or a
+            normalizer setting that cannot be compared.
     """
     reference = targets[0].configuration.as_identifier_params()
     for i, t in enumerate(targets[1:], start=1):
@@ -251,6 +254,61 @@ def _validate_configuration_consistency(targets: list[PromptTarget]) -> None:
                 f"own pipeline runs. Target 0 configuration: {reference}, "
                 f"target {i} configuration: {other}."
             )
+        # The configuration projection names each normalizer by class only, so two
+        # normalizers of one class with different settings (such as JSON-schema
+        # instruction templates) would pass the check above.
+        for reference_normalizer, other_normalizer in zip(
+            targets[0].configuration.pipeline.normalizers, t.configuration.pipeline.normalizers, strict=True
+        ):
+            if reference_normalizer is not other_normalizer and _normalizer_settings(
+                reference_normalizer
+            ) != _normalizer_settings(other_normalizer):
+                raise ValueError(
+                    f"All inner targets must configure their normalizers identically because only the "
+                    f"round-robin's own pipeline runs. Target 0 and target {i} configure "
+                    f"{type(reference_normalizer).__name__} differently."
+                )
+
+
+def _normalizer_settings(normalizer: object) -> dict[str, Any]:
+    """
+    Project a normalizer's instance settings into comparable values.
+
+    Args:
+        normalizer: The normalizer whose settings to read.
+
+    Returns:
+        dict[str, Any]: Each instance attribute mapped to a comparable value.
+    """
+    return {name: _comparable_setting(name=name, value=value) for name, value in sorted(vars(normalizer).items())}
+
+
+def _comparable_setting(*, name: str, value: Any) -> Any:
+    """
+    Convert one normalizer setting into a value that compares by content.
+
+    Args:
+        name: The attribute name, used in the error message.
+        value: The attribute value.
+
+    Returns:
+        Any: Plain data, or the identifier hash of an identifiable component.
+
+    Raises:
+        ValueError: If the value cannot be compared by content.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Identifiable):
+        return value.get_identifier().hash
+    if isinstance(value, (list, tuple)):
+        return [_comparable_setting(name=name, value=item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _comparable_setting(name=name, value=item) for key, item in sorted(value.items())}
+    raise ValueError(
+        f"Cannot compare normalizer setting '{name}' of type {type(value).__name__} across RoundRobinTarget "
+        "inner targets. Share one normalizer instance between them instead."
+    )
 
 
 def _validate_behavioral_consistency(targets: list[PromptTarget]) -> None:

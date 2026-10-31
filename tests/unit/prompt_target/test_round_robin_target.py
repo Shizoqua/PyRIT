@@ -4,8 +4,10 @@
 import pytest
 from unit.mocks import MockPromptTarget
 
+from pyrit.message_normalizer import ChatMessageNormalizer, JsonSchemaNormalizer, MessageListNormalizer
 from pyrit.models import Message
 from pyrit.prompt_target import RoundRobinTarget, TargetCapabilities, TargetConfiguration
+from pyrit.prompt_target.common.target_capabilities import CapabilityName
 
 # ── Construction validation ──────────────────────────────────────────────────
 
@@ -174,6 +176,90 @@ def test_init_rejects_mismatched_policy():
 
     with pytest.raises(ValueError, match="identical configurations"):
         RoundRobinTarget(targets=[t1, t2])
+
+
+class _OpaqueSettingNormalizer(MessageListNormalizer[Message]):
+    def __init__(self) -> None:
+        self._formatter = object()
+
+    async def normalize_async(self, messages: list[Message]) -> list[Message]:
+        return messages
+
+
+class _NestedSettingNormalizer(MessageListNormalizer[Message]):
+    def __init__(self, *, roles: list[str], options: dict[str, int]) -> None:
+        self._roles = roles
+        self._options = options
+        self._formatter = ChatMessageNormalizer()
+
+    async def normalize_async(self, messages: list[Message]) -> list[Message]:
+        return messages
+
+
+def _json_schema_target(normalizer: MessageListNormalizer[Message]) -> MockPromptTarget:
+    target = MockPromptTarget()
+    target._configuration = TargetConfiguration(
+        capabilities=TargetCapabilities(supports_multi_turn=True, supports_editable_history=True),
+        normalizer_overrides={CapabilityName.JSON_SCHEMA: normalizer},
+    )
+    return target
+
+
+@pytest.mark.usefixtures("patch_central_database")
+def test_init_rejects_different_json_schema_templates():
+    t1 = _json_schema_target(JsonSchemaNormalizer(schema_instructions_template="WRAPPER_A {schema_json}"))
+    t2 = _json_schema_target(JsonSchemaNormalizer(schema_instructions_template="WRAPPER_B {schema_json}"))
+    assert t1.configuration.as_identifier_params() == t2.configuration.as_identifier_params()
+
+    with pytest.raises(ValueError, match="configure JsonSchemaNormalizer differently"):
+        RoundRobinTarget(targets=[t1, t2])
+
+
+@pytest.mark.usefixtures("patch_central_database")
+def test_init_accepts_equal_json_schema_templates():
+    t1 = _json_schema_target(JsonSchemaNormalizer(schema_instructions_template="WRAPPER_A {schema_json}"))
+    t2 = _json_schema_target(JsonSchemaNormalizer(schema_instructions_template="WRAPPER_A {schema_json}"))
+
+    RoundRobinTarget(targets=[t1, t2])
+
+
+@pytest.mark.usefixtures("patch_central_database")
+@pytest.mark.parametrize(
+    ("other_roles", "other_options", "accepted"),
+    [
+        (["user", "assistant"], {"limit": 3}, True),
+        (["user"], {"limit": 3}, False),
+        (["user", "assistant"], {"limit": 4}, False),
+    ],
+    ids=["equal", "different-list", "different-dict"],
+)
+def test_init_compares_nested_normalizer_settings(
+    other_roles: list[str], other_options: dict[str, int], accepted: bool
+):
+    t1 = _json_schema_target(_NestedSettingNormalizer(roles=["user", "assistant"], options={"limit": 3}))
+    t2 = _json_schema_target(_NestedSettingNormalizer(roles=other_roles, options=other_options))
+
+    if accepted:
+        RoundRobinTarget(targets=[t1, t2])
+    else:
+        with pytest.raises(ValueError, match="configure _NestedSettingNormalizer differently"):
+            RoundRobinTarget(targets=[t1, t2])
+
+
+@pytest.mark.usefixtures("patch_central_database")
+def test_init_rejects_normalizer_settings_that_cannot_be_compared():
+    t1 = _json_schema_target(_OpaqueSettingNormalizer())
+    t2 = _json_schema_target(_OpaqueSettingNormalizer())
+
+    with pytest.raises(ValueError, match="Cannot compare normalizer setting '_formatter'"):
+        RoundRobinTarget(targets=[t1, t2])
+
+
+@pytest.mark.usefixtures("patch_central_database")
+def test_init_accepts_a_shared_normalizer_instance_with_opaque_settings():
+    shared = _OpaqueSettingNormalizer()
+
+    RoundRobinTarget(targets=[_json_schema_target(shared), _json_schema_target(shared)])
 
 
 @pytest.mark.usefixtures("patch_central_database")
