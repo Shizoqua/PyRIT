@@ -402,28 +402,33 @@ class HuggingFaceChatTarget(PromptTarget):
             if truncated:
                 warn_truncated_response(signal="max_new_tokens reached", limit_parameter="max_new_tokens")
 
+            model_identifier = self.model_id or self.model_path
+            effective_config = self._get_effective_generation_config()
+            response_metadata = {
+                "model_id": model_identifier or "",
+                "effective_generation_config": json.dumps(effective_config, default=str),
+            }
+
             if not assistant_response:
                 if truncated:
-                    # Deterministic generation would truncate the same way again, so do not retry.
+                    # An empty truncated response is a legitimate token-limit outcome, not a transient failure.
                     empty_response = build_empty_truncated_response(request=request)
+                    empty_piece = empty_response.message_pieces[0]
+                    empty_piece.prompt_metadata.update(response_metadata)
+                    empty_piece.mark_as_truncated()
                     set_response_metadata(pieces=empty_response.message_pieces, finish_reason="length")
                     return [empty_response]
                 raise EmptyResponseException
 
             logger.info(f"Assistant's response: {assistant_response}")
 
-            model_identifier = self.model_id or self.model_path
-
-            effective_config = self._get_effective_generation_config()
-
             response = construct_response_from_request(
                 request=request,
                 response_text_pieces=[assistant_response],
-                prompt_metadata={
-                    "model_id": model_identifier or "",
-                    "effective_generation_config": json.dumps(effective_config, default=str),
-                },
+                prompt_metadata=response_metadata,
             )
+            if truncated:
+                response.message_pieces[0].mark_as_truncated()
             set_response_metadata(pieces=response.message_pieces, finish_reason="length" if truncated else "stop")
             return [response]
 
@@ -443,14 +448,22 @@ class HuggingFaceChatTarget(PromptTarget):
         """
         if len(generated_tokens) < self.max_new_tokens:
             return False
+        generation_eos_token_ids = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
+        # GenerationConfig controls model.generate(); the tokenizer EOS is only a fallback when
+        # the generation config does not define an EOS token.
+        effective_eos_token_ids = (
+            generation_eos_token_ids
+            if generation_eos_token_ids is not None
+            else getattr(self.tokenizer, "eos_token_id", None)
+        )
         eos_token_ids: set[int] = set()
-        for candidate in (
-            getattr(getattr(self.model, "generation_config", None), "eos_token_id", None),
-            getattr(self.tokenizer, "eos_token_id", None),
+        for token_id in (
+            effective_eos_token_ids
+            if isinstance(effective_eos_token_ids, (list, tuple))
+            else [effective_eos_token_ids]
         ):
-            for token_id in candidate if isinstance(candidate, (list, tuple)) else [candidate]:
-                if isinstance(token_id, int) and not isinstance(token_id, bool):
-                    eos_token_ids.add(token_id)
+            if isinstance(token_id, int) and not isinstance(token_id, bool):
+                eos_token_ids.add(token_id)
         return int(generated_tokens[-1]) not in eos_token_ids
 
     async def _generate_async(self, *, generate_kwargs: dict[str, Any]) -> Any:
