@@ -452,7 +452,9 @@ class HuggingFaceChatTarget(PromptTarget):
         # GenerationConfig controls model.generate(); the tokenizer EOS is only a fallback when
         # the generation config does not define an EOS token.
         effective_eos_token_ids = (
-            generation_eos_token_ids if generation_eos_token_ids is not None else getattr(self.tokenizer, "eos_token_id", None)
+            generation_eos_token_ids
+            if generation_eos_token_ids is not None
+            else getattr(self.tokenizer, "eos_token_id", None)
         )
         eos_token_ids: set[int] = set()
         for token_id in (
